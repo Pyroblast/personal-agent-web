@@ -1,0 +1,36 @@
+{
+  "name": "personal-agent-mvp",
+  "version": "3.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.22.1"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.ui.json && vite build",
+    "start": "node dist/server.js",
+    "web": "npm run build && npm start",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "check:dsh": "node scripts/check-dsh.mjs",
+    "setup:runtime": "node scripts/setup-runtime.mjs",
+    "local": "node scripts/local.mjs start",
+    "local:open": "node scripts/local.mjs open",
+    "local:stop": "node scripts/local.mjs stop"
+  },
+  "dependencies": {
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "prettier": "3.6.2",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "vite": "8.3.5"
+  },
+  "license": "MIT"
+}

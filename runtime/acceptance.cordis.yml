@@ -1,0 +1,5 @@
+# Test-only lower pressure threshold. Never loaded by the normal launcher.
+- id: compaction-basic
+  config:
+    thresholdRatio: 0.01
+    retainTokens: 1024
