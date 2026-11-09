@@ -539,7 +539,7 @@ function App() {
                     <div className="suggestions">
                       {[
                         "我通常晚饭后练吉他，这周晚上要加班",
-                        "帮我查找公开的天文观测资料，附上来源",
+                        "帮我搜索北京近期的吉他演出，给我来源",
                       ].map((s) => (
                         <button key={s} onClick={() => setDraft(s)}>
                           {s} ↗

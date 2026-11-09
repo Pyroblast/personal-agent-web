@@ -198,3 +198,13 @@ test("wall-clock deadline fences writes after a long pause", async () => {
     s.close();
   }
 });
+
+test('pinned DSH compiles every model-facing schema; plugin startup cannot silently lose tools',async()=>{
+  const prior=process.env.PA_WORK_SEARCH;process.env.PA_WORK_SEARCH='0';
+  try {
+    const plugin=await import('../runtime/product-plugin.mjs' as string);
+    const names:string[]=[];
+    plugin.apply({tools:{guard:()=>{},register:(t:any)=>names.push(t.name)},systemPrompt:{context:()=>{}},on:()=>{}});
+    assert.deepEqual(names.sort(),[...ALLOWED].sort());
+  } finally {if(prior===undefined) delete process.env.PA_WORK_SEARCH;else process.env.PA_WORK_SEARCH=prior;}
+});

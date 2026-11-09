@@ -33,7 +33,14 @@ const names = upkeep
           "care_policy",
           "agent_profile",
           ...(workEnabled
-            ? [...workTools.map((t) => t[0]), "work_context", "artifact_read"]
+            ? [
+                ...workTools.map((t) => t[0]),
+                "work_context",
+                "artifact_read",
+                "context_search",
+                "matter_update",
+                "goal_offer",
+              ]
             : []),
         ];
 export function apply(ctx) {
@@ -159,6 +166,63 @@ export function apply(ctx) {
         exec.signal,
       ),
     );
+  register(
+    "context_search",
+    "定向检索用户历史，适用于当前上下文没有找到答案。统一过滤已遗忘、过期和被替代材料。未命中不等于用户没说；historical 只用于用户明确要求回顾。",
+    {
+      query: { type: "string", required: true },
+      goalId: { type: "string" },
+      historical: { type: "boolean" },
+    },
+    (a, e) =>
+      request("context-search", { session: e.agent.id, ...a }, e.signal),
+  );
+  register(
+    "matter_update",
+    "维护对话事项的决定、下一步和待答问题。已有Goal传goal_id，否则沿用matter_id；新讨论事项action=matter可零Goal保存。revision来自personalContext.working。不创建任务或授予权限。item.label须摘录用户原话，reported_done仅用户自报。用户回答已有问题须action=answer，传问题id。用户只是不想被追问某问题，必须pause_question+问题id；不能改整个Goal通知。用户选择或放弃方案用item，决定状态selected/rejected；不要仅写goal_progress而遗漏当前决定。",
+    {
+      action: {
+        type: "string",
+        enum: ["matter", "item", "question", "answer", "pause_question"],
+        required: true,
+      },
+      operation_id: { type: "string", required: true },
+      evidence: { type: "string", required: true },
+      goal_id: { type: "string" },
+      matter_id: { type: "string" },
+      revision: { type: "integer" },
+      title: { type: "string" },
+      id: { type: "string" },
+      branch: { type: "string" },
+      deadline: { type: "integer" },
+      task_id: { type: "string" },
+      dependencies: { type: "array", items: { type: "string" } },
+      label: { type: "string" },
+      owner: { type: "string", enum: ["agent", "user", "external"] },
+      decision: {
+        type: "string",
+        enum: ["proposed", "selected", "rejected", "reported_done"],
+      },
+      next_action: { type: "string" },
+      semantic_key: { type: "string" },
+      question: { type: "string" },
+    },
+    (args, e) =>
+      request("matter-update", { session: e.agent.id, args }, e.signal),
+  );
+  register(
+    "goal_offer",
+    "在用户尚未委托持续推进时提出明确提议，不开启任务。先保存或复用Goal。scope是将实际向用户展示的一句完整提议，说明持续范围、停止条件及联系方式；必须在本轮最终回答逐字呈现scope，才成为可确认提议。后续唯一提议的自然肯定可用goal_manage upgrade接住，不索要口令。",
+    {
+      goal_id: { type: "string", required: true },
+      goal_revision: { type: "integer", required: true },
+      evidence: { type: "string", required: true },
+      scope: { type: "string", required: true },
+      allow_search: { type: "boolean" },
+      support_until: { type: "integer" },
+    },
+    (args, e) => request("goal-offer", { session: e.agent.id, args }, e.signal),
+  );
   register(
     "work_context",
     "读取当前工作范围、目标、事实、安排与有效版本；不授予额外权限。",

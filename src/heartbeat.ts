@@ -1,3 +1,5 @@
+import { ContextService } from "./context-service.js";
+import { proactiveContext } from "./proactive-context.js";
 import { randomUUID, createHash } from "node:crypto";
 import { Store, InputError, text } from "./store.js";
 import { migrateDeliveries } from "./work-schema.js";
@@ -318,6 +320,7 @@ export class Heartbeat {
       return budget >= 0;
     });
     return {
+      personalContext: proactiveContext(this.store),
       policy: this.policy(),
       memoryVersion: this.version(),
       latestUser: this.latestUser()?.id || null,
@@ -436,12 +439,19 @@ export class Heartbeat {
       if (!c || c.status !== "running" || r?.status !== "running") return;
       const snapshot = JSON.parse(c.snapshot);
       let invalid = this.gate(false);
+      if (!new ContextService(this.store, this.now).check(runId, "delivery"))
+        invalid = "工作状态或输入水位变化";
       if (
         this.policy().revision !== snapshot.policy.revision ||
         this.version() !== snapshot.memoryVersion ||
         (this.latestUser()?.id || null) !== snapshot.latestUser
       )
         invalid = "检查期间记忆、设置或用户输入发生变化";
+      if (
+        digest({ ...(snapshot.personalContext ?? {}), coverage: undefined }) !==
+        digest({ ...proactiveContext(this.store), coverage: undefined })
+      )
+        invalid = "事项、用户事实或近期交付已变化，本轮关心不再发送";
       if (invalid) {
         this.finish(c, "cancelled", invalid);
         return;
@@ -505,6 +515,38 @@ export class Heartbeat {
         this.finish(c, "failed", "提案缺少有效记忆依据或内容无效");
         return;
       }
+      const goalId = proposal.goalId ?? null;
+      if (goalId !== null) {
+        const matter = snapshot.personalContext.matters.find(
+          (g: any) => g.id === goalId,
+        );
+        if (
+          !matter ||
+          matter.notificationMode !== "milestones_and_decisions" ||
+          new ContextService(this.store, this.now).contactLimit(goalId)
+        ) {
+          this.finish(c, "skipped", "事项归属或联系策略不允许本次关心");
+          return;
+        }
+      }
+      let questionId: string | null = null;
+      if (proposal.question && goalId) {
+        const q = new ContextService(this.store, this.now).question(
+          goalId,
+          proposal.question.key,
+          proposal.question.text,
+        );
+        questionId = q.id;
+        if (
+          !new ContextService(this.store, this.now).questionAllowed(
+            q.id,
+            goalId,
+          )
+        ) {
+          this.finish(c, "skipped", "该问题已回答、暂停或已由其他来源询问");
+          return;
+        }
+      }
       const blocked = this.topicBlocked(topic);
       if (blocked) {
         this.finish(c, "skipped", blocked);
@@ -530,6 +572,8 @@ export class Heartbeat {
         this.finish(c, "skipped", "相同内容已交付");
         return;
       }
+      if (questionId)
+        new ContextService(this.store, this.now).deliveredQuestion(questionId);
       const mid = "proactive-" + c.id,
         now = this.now();
       this.store.db
@@ -537,7 +581,7 @@ export class Heartbeat {
         .run(mid, mid, proposal.message, now);
       this.store.db
         .prepare(
-          "INSERT INTO deliveries(id,run_id,check_id,message_id,topic,body_hash,created_at,reason,memory_refs) VALUES(?,?,?,?,?,?,?,?,?)",
+          "INSERT INTO deliveries(id,run_id,check_id,message_id,topic,body_hash,created_at,reason,memory_refs,goal_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
         )
         .run(
           randomUUID(),
@@ -549,6 +593,7 @@ export class Heartbeat {
           now,
           proposal.reason,
           JSON.stringify(refs),
+          goalId,
         );
       this.finish(c, "delivered", proposal.reason, proposal);
     });

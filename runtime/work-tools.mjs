@@ -39,7 +39,7 @@ export const workTools = [
   ],
   [
     "goal_manage",
-    "创建持续委托，或暂停、恢复、结束和设置目标。具体提醒/单次报告用 task_manage，不先另建目标。创建/升级必须有用户持续推进授权 autonomous=true；如果用户限定只跟进一段时间，必须把截止毫秒时间戳写入 support_until，不把出行日期当成授权截止，准确说明范围和完成条件，公开资料研究可 allow_search=true，不允许预订付款。暂停整个目标与仅暂停自主推进不同。完成现实目标必须有用户确认，不根据日期推断。归属不清先澄清；更新传 id/revision。",
+    "保存目标或管理持续委托。实际计划选定方向或用户要求记下时 action=create, autonomous=false，允许日期未定和零任务。愿望、咨询、假设不创建。持续委托 autonomous=true；自然确认前文提议时用 upgrade 并带 personalContext.proposals 中唯一有效 proposal_id，逐字复用其范围参数，不要求授权口令。创建持续委托，或暂停、恢复、结束和设置目标。具体提醒/单次报告用 task_manage，不先另建目标。只有自主推进的创建/升级才需要持续委托；如果用户限定只跟进一段时间，必须把截止毫秒时间戳写入 support_until，不把出行日期当成授权截止，准确说明范围和完成条件，公开资料研究可 allow_search=true，不允许预订付款。暂停整个目标与仅暂停自主推进不同。完成现实目标必须有用户确认，不根据日期推断。归属不清先澄清；更新传 id/revision（兼容goal_id/goal_revision，不能提供冲突值）。单目标联系上限用notification动作的contact_limit:{count:1,days:7}表示每周最多一次，各来源合并计数，不影响明确提醒。",
     {
       action: {
         type: "string",
@@ -61,12 +61,22 @@ export const workTools = [
       operation_id: { type: "string", required: true },
       evidence: { type: "string", required: true },
       id: { type: "string" },
+      goal_id: { type: "string" },
+      goal_revision: { type: "integer" },
       revision: { type: "integer" },
       title: { type: "string" },
       autonomous: { type: "boolean" },
+      proposal_id: { type: "string" },
+      matter_id: { type: "string" },
+      new_matter: { type: "boolean" },
       allow_search: { type: "boolean" },
       completion_criteria: { type: "string" },
       support_until: { type: "integer" },
+      contact_limit: {
+        type: "object",
+        additionalProperties: false,
+        properties: { count: { type: "integer" }, days: { type: "integer" } },
+      },
       notification_mode: {
         type: "string",
         enum: [
@@ -80,7 +90,7 @@ export const workTools = [
   ],
   [
     "goal_progress",
-    "记录用户本轮提供的目标事实、改期或进展；不是通用记忆。必须确定 goal_id 与 goal_revision，多个可能目标先澄清且不写入。fact 必须是本轮用户原文的连续摘录，不得改写，也不能保存助理清单、建议或推断；纠正已有项带 fact_id。increment 增加已有数值，cumulative 是累计总值。改出行日期只更新事实，服务废弃旧内部安排；不能擅改用户显式提醒。",
+    "记录用户本轮提供的目标事实、改期或进展；不是通用记忆。必须确定 goal_id 与 goal_revision，多个可能目标先澄清且不写入。fact 必须是本轮用户原文的连续摘录，不得改写，也不能保存助理清单、建议或推断；纠正已有项带 fact_id；原记录含多项信息时必须用 replace_span 指定唯一的最小原文片段，服务保留其他部分及来源，无需让用户复述。increment 增加已有数值，cumulative 是累计总值。改出行日期只更新事实，服务废弃旧内部安排；不能擅改用户显式提醒。",
     {
       operation_id: { type: "string", required: true },
       evidence: { type: "string", required: true },
@@ -88,6 +98,7 @@ export const workTools = [
       goal_revision: { type: "integer", required: true },
       fact: { type: "string", required: true },
       fact_id: { type: "string" },
+      replace_span: { type: "string" },
       progress_mode: {
         type: "string",
         enum: ["fact", "correct", "increment", "cumulative"],

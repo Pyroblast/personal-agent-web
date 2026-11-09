@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Store } from "../src/store.js";
 import { Heartbeat } from "../src/heartbeat.js";
+import { proactiveContext } from "../src/proactive-context.js";
 import { Profile } from "../src/profile.js";
 import { Work } from "../src/work.js";
 import { DAY, MINUTE } from "../src/work-schema.js";
@@ -901,5 +902,78 @@ test("successive goal drafts share a versioned artifact even when model omits th
   assert.equal(all[0].version, 2);
   assert.equal(f.w.artifact(all[0].id, 1).historicalContext, true);
   assert.equal(f.w.artifact(all[0].id, 2).historicalContext, false);
+  f.s.close();
+});
+
+test("care keeps corrected answers scoped beyond the recent chat window and rejects a stale decision", () => {
+  const f = fixture();
+  const first = f.goal().goal_id;
+  const second = f.goal().goal_id;
+  const record = (id: string, fact: string, correction?: string) =>
+    f.command("goal_progress", {
+      goal_id: id,
+      goal_revision: f.w.goal(id).revision,
+      fact,
+      progress_mode: correction ? "correct" : "fact",
+      fact_id: correction,
+    });
+  const original = record(first, "计划在甲区活动").fact.id;
+  record(first, "改在乙区活动", original);
+  record(second, "在丙区活动");
+  for (let i = 0; i < 10; i++)
+    f.s.db
+      .prepare("INSERT INTO messages VALUES(?,?,?,?,?,?)")
+      .run("m" + i, "m" + i, "assistant", "其他对话", "completed", f.now + i);
+  f.s.saveMemory({ content: "本周出行，希望适时获得建议", kind: "preference" });
+  f.h.update({ enabled: true, startHour: 0, endHour: 24 }, 1);
+  const run = f.h.claim(true) as any;
+  f.s.startRun(run.id, "case");
+  const ctx = f.h.context(run.id);
+  assert(!JSON.stringify(ctx.recent).includes("乙区"));
+  const facts = ctx.personalContext.matters.find(
+    (g: any) => g.id === first,
+  ).userFacts;
+  assert.deepEqual(
+    facts.map((x: any) => x.text),
+    ["改在乙区活动"],
+  );
+  record(first, "住宿我会自己安排");
+  f.h.settle(
+    run.id,
+    JSON.stringify({ decision: "silent", reason: "no change" }),
+  );
+  assert.equal(f.h.status().checks[0].status, "cancelled");
+  f.s.setMeta("context_epoch", String(f.now + 100));
+  assert.equal(f.h.snapshot().personalContext.matters.length, 2); // 3.1 epoch invalidates runs, not unrelated goals
+  f.s.close();
+});
+
+test("a goal-related heartbeat remains visible to later work for that goal only", () => {
+  const f = fixture();
+  const first = f.goal().goal_id,
+    other = f.goal().goal_id;
+  const mem = f.s.saveMemory({
+    content: "用户周末出行",
+    kind: "preference",
+  }) as any;
+  f.h.update({ enabled: true, startHour: 0, endHour: 24 }, 1);
+  const r = f.h.claim(true) as any;
+  f.s.startRun(r.id, "check");
+  f.h.settle(
+    r.id,
+    JSON.stringify({
+      decision: "contact",
+      topic: "travel",
+      memoryIds: [mem.id],
+      goalId: first,
+      reason: "出发准备已更新",
+      message: "新准备清单可查看。",
+    }),
+  );
+  assert.equal(f.h.status().checks[0].status, "delivered");
+  const known = f.h.snapshot().personalContext.contacts;
+  assert.equal(known[0].goal_id, first);
+  assert.equal(proactiveContext(f.s, first).contacts.length, 1);
+  assert.equal(proactiveContext(f.s, other).contacts.length, 0);
   f.s.close();
 });

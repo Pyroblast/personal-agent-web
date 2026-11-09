@@ -1,3 +1,5 @@
+import { ContextService } from "./context-service.js";
+import { loadedSkills } from "./skills.js";
 import { fork, type ChildProcess } from "node:child_process";
 import { mkdirSync, appendFileSync } from "node:fs";
 import { resolve, join } from "node:path";
@@ -22,6 +24,9 @@ export const ALLOWED = [
   "goal_progress",
   "work_context",
   "artifact_read",
+  "context_search",
+  "matter_update",
+  "goal_offer",
 ];
 export class Engine {
   child?: ChildProcess;
@@ -258,6 +263,31 @@ export class Engine {
           void this.fail("执行期限已过，恢复后没有发布过时回复。");
           return;
         }
+        if (
+          /<[｜|].*(?:DSML|tool_call)|<tool_call>|<function_calls>/s.test(
+            m.text || "",
+          )
+        ) {
+          if (!r.formatRepair) {
+            r.formatRepair = true;
+            this.child?.send({
+              type: "run",
+              sessionId: r.session_id,
+              resume: false,
+              text: "产品执行反馈：上一条输出包含未执行的工具标记，不能交付。请使用真实工具调用协议完成原用户请求，不能把工具代码作为回答。原用户输入仍以currentInput为准，不增加权限。若无法调用，请简短说明未完成，不声称成功。",
+            });
+          } else
+            void this.fail(
+              "模型输出格式异常，未发布未执行的工具标记；已完成动作保留。",
+            );
+          return;
+        }
+        if (this.store.active(r.session_id).steps < 1) {
+          void this.fail(
+            "受限工具与上下文未完成初始化，本轮未交付。请核对运行时配置。",
+          );
+          return;
+        }
         const reason = m.turnEnd?.reason;
         if (reason?.kind !== "completed" || !m.text?.trim()) {
           void this.fail(
@@ -357,7 +387,10 @@ export class Engine {
     });
   }
   async pump() {
-    if (!this.closing && this.bridgeUrl) this.work.tick();
+    if (!this.closing && this.bridgeUrl) {
+      new ContextService(this.store).indexPending();
+      this.work.tick();
+    }
     if (
       this.pumping ||
       this.stopping ||
@@ -391,6 +424,10 @@ export class Engine {
         .prepare("UPDATE runs SET profile_revision=? WHERE id=?")
         .run(this.profile.get().revision, r.id);
       this.active = this.store.active(session);
+      if (this.isHeartbeat() || this.isWork()) {
+        const scope = this.isWork() ? this.work.context(r.id).goal.id : null;
+        new ContextService(this.store).capture(r.id, scope);
+      }
       this.searchCalls = 0;
       this.webKinds = {};
       this.providerIssue = "";
@@ -547,6 +584,11 @@ export class Engine {
       throw new InputError("执行期限已过", 409);
     }
     const background = r.trigger_type !== "user_message";
+    if (
+      (this.isHeartbeat() || this.isWork()) &&
+      !new ContextService(this.store).check(r.id, "execution")
+    )
+      throw new InputError("工作状态已变化，请按最新信息重新评估", 409);
     const upkeep = r.trigger_type === "memory_upkeep";
     const work = WORK_MODES.includes(r.trigger_type);
     const allowed = this.toolsForRun();
@@ -571,8 +613,20 @@ export class Engine {
                 ...this.heartbeat.chatContext(r.message_id),
                 ...this.work.chatContext(r.message_id),
               };
+      const skills = loadedSkills(
+        r.trigger_type,
+        r.body +
+          JSON.stringify(
+            (base as any).goal || (base as any).personalContext?.matters || [],
+          ),
+      );
+      for (const skill of skills)
+        this.store.db
+          .prepare("INSERT OR REPLACE INTO run_skills VALUES(?,?,?)")
+          .run(r.id, skill.name, skill.version);
       return {
         ...base,
+        skillContext: skills,
         agentProfile: this.profile.context(),
         memoryOverview: upkeep ? [] : this.upkeep.current()?.overview || [],
         memoryReviewCandidates: upkeep
@@ -583,10 +637,31 @@ export class Engine {
             })),
       };
     }
+    if (path === "context-search") {
+      if (background) throw new InputError("该模式未开放历史搜索工具", 403);
+      return new ContextService(this.store).search(
+        String(b.query || ""),
+        b.goalId || null,
+        b.historical === true,
+      );
+    }
+    if (path === "matter-update") {
+      if (background) throw new InputError("后台不能修改用户决定", 403);
+      if (b.args.goal_id)
+        this.work.assertScope(r, this.work.goal(b.args.goal_id), "goal");
+      return new ContextService(this.store).action(r.id, b.args);
+    }
+    if (path === "goal-offer") {
+      if (background) throw new InputError("后台不能创建委托", 403);
+      return this.work.offer(r.id, b.args);
+    }
     if (path === "work-context")
       return work
         ? this.work.context(r.id)
-        : this.work.chatContext(r.message_id);
+        : {
+            ...this.work.chatContext(r.message_id),
+            personalContext: new ContextService(this.store).build(null, r.body),
+          };
     if (path === "work-action") {
       if (background) throw new InputError("后台不能管理用户委托", 403);
       return this.work.command(b.name, b.args, r.id, String(b.callId));
@@ -595,8 +670,14 @@ export class Engine {
       if (!work) throw new InputError("只允许当前工作保存草稿", 403);
       return this.work.stage(r.id, b.args);
     }
-    if (path === "artifact-read")
-      return work ? this.work.readForRun(r.id, b.id) : this.work.artifact(b.id);
+    if (path === "artifact-read") {
+      const a = work
+        ? this.work.readForRun(r.id, b.id)
+        : this.work.artifact(b.id);
+      if (a.historicalContext)
+        throw new InputError("成果依据已失效，请使用当前事实重新整理", 409);
+      return a;
+    }
     if (path === "agent-profile") {
       if (background) throw new InputError("后台不能修改助理设置", 403);
       return this.profile.action(r.id, String(b.callId), b.args);

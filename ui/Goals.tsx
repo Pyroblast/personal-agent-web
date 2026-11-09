@@ -103,6 +103,10 @@ export function GoalsPanel({
   const tasks = data.tasks.filter((t: any) => t.goal_id === g?.id),
     artifacts = data.artifacts.filter((a: any) => a.goal_id === g?.id),
     events = data.events.filter((e: any) => e.goal_id === g?.id).slice(0, 20);
+  const contactLimit = data.contactLimits?.find(
+    (l: any) => l.goal_id === g?.id,
+  );
+  const working = data.workingStates?.find((m: any) => m.goal_id === g?.id);
   const d = settings || data.defaults;
   const openArtifact = async (id: string, version?: number) => {
     setArtifactError("");
@@ -261,19 +265,23 @@ export function GoalsPanel({
                   select(x.id);
                   if (window.matchMedia("(max-width:760px)").matches)
                     requestAnimationFrame(() =>
-                      document
-                        .getElementById("goal-detail")
-                        ?.scrollIntoView({
-                          behavior: "smooth",
-                          block: "start",
-                        }),
+                      document.getElementById("goal-detail")?.scrollIntoView({
+                        behavior: "smooth",
+                        block: "start",
+                      }),
                     );
                 }}
               >
                 <strong>{x.title}</strong>
-                <span>{labels[x.status] || x.status}</span>
+                <span>
+                  {x.execution_policy === "record_only" && x.status === "active"
+                    ? "已记录"
+                    : labels[x.status] || x.status}
+                </span>
                 <small>
-                  {x.next_action || x.wait_condition || "准备接下来的安排"}
+                  {x.execution_policy === "record_only"
+                    ? "已记录 · 暂不主动跟进"
+                    : x.next_action || x.wait_condition || "准备接下来的安排"}
                 </small>
               </button>
             ))}
@@ -289,11 +297,54 @@ export function GoalsPanel({
           </div>
           {g ? (
             <div className="goal-detail" id="goal-detail">
-              <span className="goal-status">{labels[g.status]}</span>
+              <span className="goal-status">
+                {g.execution_policy === "record_only" && g.status === "active"
+                  ? "已记录"
+                  : labels[g.status]}
+              </span>
               <h2>{g.title}</h2>
               <div className="goal-next">
                 <small>下一步</small>
                 <p>{g.next_action || g.wait_condition || "等待下一次推进"}</p>
+                {g.execution_policy === "record_only" && (
+                  <button
+                    onClick={() =>
+                      chat(`请持续跟进「${g.title}」，先和我确认范围。`)
+                    }
+                  >
+                    讨论下一步
+                  </button>
+                )}
+                {working &&
+                  (working.items.length > 0 ||
+                    working.questions.length > 0) && (
+                    <details>
+                      <summary>决定与待办</summary>
+                      {working.items.map((item: any) => (
+                        <p key={item.id}>
+                          {item.decision === "reported_done"
+                            ? "你已确认完成"
+                            : item.decision === "selected"
+                              ? "已选择"
+                              : item.decision === "rejected"
+                                ? "暂不采用"
+                                : "考虑中"}{" "}
+                          · {item.label}
+                          {item.next_action && ` — ${item.next_action}`}
+                        </p>
+                      ))}
+                      {working.questions.map((q: any) => (
+                        <p key={q.id}>
+                          {q.status === "answered"
+                            ? "已回答"
+                            : q.status === "paused"
+                              ? "暂缓"
+                              : "待决定"}{" "}
+                          · {q.question}
+                        </p>
+                      ))}
+                    </details>
+                  )}
                 {g.support_until && (
                   <small>自主跟进授权至：{time(g.support_until)}</small>
                 )}
@@ -610,6 +661,51 @@ export function GoalsPanel({
                       ))}
                     </select>
                     <small>静默仍继续工作；明确交付的提醒保留原约定。</small>
+                  </label>
+                )}
+                {g.execution_policy === "autonomous" && (
+                  <label>
+                    这个目标的联系上限
+                    <select
+                      aria-label="这个目标的联系上限"
+                      disabled={busy}
+                      value={
+                        contactLimit
+                          ? `${contactLimit.count}/${contactLimit.days}`
+                          : "default"
+                      }
+                      onChange={(e) => {
+                        const [count, days] = e.target.value
+                          .split("/")
+                          .map(Number);
+                        void goalAction("notification", {
+                          notification_mode: g.notification_mode,
+                          contact_limit:
+                            e.target.value === "default"
+                              ? null
+                              : { count, days },
+                        });
+                      }}
+                    >
+                      <option value="default">沿用共同联系偏好</option>
+                      <option value="1/7">每 7 天最多一次</option>
+                      <option value="2/7">每 7 天最多两次</option>
+                      <option value="1/1">每天最多一次</option>
+                      {contactLimit &&
+                        !["1/7", "2/7", "1/1"].includes(
+                          `${contactLimit.count}/${contactLimit.days}`,
+                        ) && (
+                          <option
+                            value={`${contactLimit.count}/${contactLimit.days}`}
+                          >
+                            每 {contactLimit.days} 天最多 {contactLimit.count}{" "}
+                            次
+                          </option>
+                        )}
+                    </select>
+                    <small>
+                      关心与目标进展合并计算；你明确约定的提醒不受影响。
+                    </small>
                   </label>
                 )}
                 {!ended(g.status) && (

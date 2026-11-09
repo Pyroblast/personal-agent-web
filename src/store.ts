@@ -1,3 +1,4 @@
+import { ContextService, migrateContext } from "./context-service.js";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID, createHash } from "node:crypto";
 export class InputError extends Error {
@@ -66,6 +67,7 @@ export class Store {
       .exec(`CREATE TABLE IF NOT EXISTS actions(run_id TEXT NOT NULL,call_id TEXT NOT NULL,name TEXT NOT NULL,args TEXT NOT NULL,result TEXT NOT NULL,PRIMARY KEY(run_id,call_id));
       CREATE TABLE IF NOT EXISTS memory_sources(memory_id TEXT NOT NULL,source_message_id TEXT NOT NULL,PRIMARY KEY(memory_id,source_message_id));
       CREATE TABLE IF NOT EXISTS sources(id TEXT PRIMARY KEY,run_id TEXT NOT NULL,url TEXT NOT NULL,title TEXT NOT NULL,snippet TEXT NOT NULL,published_at TEXT, fetched_at INTEGER NOT NULL,UNIQUE(run_id,url));`);
+    migrateContext(this);
   }
   close() {
     this.db.close();
@@ -204,6 +206,7 @@ export class Store {
       )
         throw new InputError("记忆已变化，请刷新后重试", 409);
       if (old) {
+        new ContextService(this).retireMemory(old, "corrected");
         this.db.prepare("DELETE FROM memory_sources WHERE memory_id=?").run(id);
         this.db
           .prepare(
@@ -247,6 +250,12 @@ export class Store {
   forget(id: string, revision: unknown) {
     if (!Number.isSafeInteger(revision)) throw new InputError("记忆版本无效");
     return this.transaction(() => {
+      const old = this.db
+        .prepare(
+          "SELECT * FROM memories WHERE id=? AND revision=? AND status='active'",
+        )
+        .get(id, revision as number);
+      if (old) new ContextService(this).retireMemory(old, "forgotten");
       const r = this.db
         .prepare(
           "UPDATE memories SET status='forgotten',content='',revision=revision+1,updated_at=? WHERE id=? AND revision=? AND status='active'",
@@ -354,6 +363,19 @@ export class Store {
       this.db
         .prepare("UPDATE messages SET status='completed' WHERE id=?")
         .run(r.message_id);
+      this.db
+        .prepare(
+          "UPDATE delegation_proposals SET status='offered' WHERE run_id=? AND status='draft' AND instr(?,scope)>0",
+        )
+        .run(id, body);
+      for (const q of this.db
+        .prepare(
+          "SELECT q.id,q.question FROM open_questions q WHERE q.status='open' AND q.delivered_at IS NULL AND q.source_id=?",
+        )
+        .all(r.message_id) as any[]) {
+        if (body.includes(q.question))
+          new ContextService(this).deliveredQuestion(q.id);
+      }
       // A forget acknowledgement can itself repeat the removed fact: exclude that turn too.
       if (
         this.db
@@ -432,6 +454,7 @@ export class Store {
       ...c,
       memories,
       recent,
+      personalContext: new ContextService(this).build(null, r.body),
       currentInput: r.body,
       sourceMessageId: r.message_id,
       timezone: "Asia/Shanghai",
@@ -524,6 +547,12 @@ export class Store {
         .get(now) as any
     ).t;
     if (latest && latest > Number(this.getMeta("expiry_checked") || 0)) {
+      for (const m of this.db
+        .prepare(
+          "SELECT * FROM memories WHERE status='active' AND expires_at<=? AND expires_at>?",
+        )
+        .all(now, Number(this.getMeta("expiry_checked") || 0)) as any[])
+        new ContextService(this, () => now).retireMemory(m, "expired");
       this.invalidateContext(now);
       this.setMeta("expiry_checked", String(latest));
     }

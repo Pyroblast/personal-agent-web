@@ -1,3 +1,5 @@
+import { ContextService } from "./context-service.js";
+import { proactiveContext } from "./proactive-context.js";
 import { randomUUID, createHash } from "node:crypto";
 import { Store, InputError, text } from "./store.js";
 import { Heartbeat, dayStart } from "./heartbeat.js";
@@ -29,6 +31,8 @@ export class Work {
   ) {
     migrateWork(store);
     this.recover();
+    for (const g of this.db.prepare("SELECT id FROM goals").all() as any[])
+      new ContextService(store, now).matter(g.id);
   }
   get db() {
     return this.store.db;
@@ -69,6 +73,12 @@ export class Work {
   }
   state() {
     return {
+      contactLimits: this.db.prepare("SELECT * FROM goal_contact_limits").all(),
+      workingStates: (
+        this.db
+          .prepare("SELECT * FROM matters WHERE goal_id IS NOT NULL")
+          .all() as any[]
+      ).map((m) => new ContextService(this.store, this.now).view(m)),
       goals: (
         this.db
           .prepare("SELECT id FROM goals ORDER BY updated_at DESC,rowid DESC")
@@ -114,7 +124,9 @@ export class Work {
       contactPolicy: this.heartbeat.policy(),
       contextEpoch: Number(this.store.getMeta("context_epoch") || 0),
       actions: this.db
-        .prepare("SELECT run_id,name,result FROM work_actions ORDER BY rowid")
+        .prepare(
+          "SELECT run_id,name,result FROM work_actions UNION ALL SELECT run_id,'matter_update' name,result FROM context_actions",
+        )
         .all(),
     };
   }
@@ -166,7 +178,7 @@ export class Work {
   makeGoal(a: any, authority: string, kind: string) {
     const id = randomUUID(),
       now = this.now(),
-      autonomous = kind === "outcome";
+      autonomous = kind === "outcome" && a.autonomous === true;
     this.db
       .prepare(
         "INSERT INTO goals(id,title,kind,status,execution_policy,support_enabled,authority_ref,completion_criteria,allow_search,created_at,updated_at) VALUES(?,?,?,'active',?,?,?,?,?,?,?)",
@@ -175,7 +187,11 @@ export class Work {
         id,
         text(a.title, 120),
         kind,
-        autonomous ? "autonomous" : "contract_only",
+        autonomous
+          ? "autonomous"
+          : kind === "outcome"
+            ? "record_only"
+            : "contract_only",
         autonomous ? 1 : 0,
         authority,
         text(
@@ -204,6 +220,7 @@ export class Work {
       "已接住这件事",
       authority.startsWith("ui:") ? undefined : authority,
     );
+    new ContextService(this.store, this.now).matter(id);
     if (autonomous) this.schedule("goal:" + id, "goal_evaluate", now + MINUTE);
     return this.goal(id);
   }
@@ -219,6 +236,7 @@ export class Work {
       "deliver_local",
       "recurrence",
       "dependency_id",
+      "fact_ids",
       "allow_search",
       "delivery_mode",
       "quiet_behavior",
@@ -247,6 +265,13 @@ export class Work {
       throw new InputError("交付时间不能早于开始执行时间");
     if (owner === "goal" && recurrence !== "once")
       throw new InputError("内部安排只能是有界单次任务");
+    const factIds = a.fact_ids ?? (g.facts as any[]).map((f) => f.id);
+    if (
+      !Array.isArray(factIds) ||
+      factIds.length > 64 ||
+      factIds.some((id: any) => !(g.facts as any[]).some((f) => f.id === id))
+    )
+      throw new InputError("任务事实依赖须来自当前目标");
     const dep = a.dependency_id ? this.task(a.dependency_id) : null;
     if (dep && (dep.goal_id !== g.id || dep.dependency_id))
       throw new InputError("依赖必须是同目标中的单层任务");
@@ -309,6 +334,9 @@ export class Work {
         now,
         now,
       );
+    this.db
+      .prepare("INSERT INTO task_fact_dependencies VALUES(?,?)")
+      .run(id, json(factIds));
     if (end)
       this.db.prepare("UPDATE tasks SET ends_at=? WHERE id=?").run(end, id);
     if (initial === "scheduled") this.schedule("task:" + id, "work_task", due);
@@ -435,7 +463,125 @@ export class Work {
         409,
       );
   }
+  assertDelegation(actor: any, a: any, g?: any) {
+    if (a.proposal_id) {
+      const offers = this.db
+        .prepare(
+          "SELECT * FROM delegation_proposals WHERE status='offered' AND expires_at>?",
+        )
+        .all(this.now()) as any[];
+      const p = offers.find((x) => x.id === a.proposal_id);
+      if (
+        !p ||
+        offers.length !== 1 ||
+        !g ||
+        p.goal_id !== g.id ||
+        p.goal_revision !== g.revision ||
+        p.allow_search !== Number(!!a.allow_search) ||
+        p.support_until !== (a.support_until ?? null)
+      )
+        throw new InputError("提议不唯一、已变化或范围不符，请澄清", 409);
+      if (/不|别|仅|只|假设|假如|如果|例如|他说|她说|[“”「」]/.test(actor.body))
+        throw new InputError("不是无歧义的完整接受，请澄清");
+      // The model resolves intent; service binds the acceptance to one actually delivered, unchanged offer.
+      this.db
+        .prepare(
+          "UPDATE delegation_proposals SET status='accepted',accepted_source=? WHERE id=?",
+        )
+        .run(actor.message_id, p.id);
+      return;
+    }
+    if (
+      !/持续|跟进|推进|照看|直到|全程|帮我安排|帮我完成|制定.*计划|恢复/.test(
+        a.evidence,
+      ) ||
+      /不要.*(?:跟进|推进)|不.*授权|仅.*记|只.*记/.test(actor.body)
+    )
+      throw new InputError("请保存目标或基于唯一提议确认持续范围");
+  }
+  offer(runId: string, a: any) {
+    return this.store.transaction(() => {
+      const r = this.db
+        .prepare(
+          "SELECT r.*,m.body FROM runs r JOIN messages m ON m.id=r.message_id WHERE r.id=? AND r.status='running' AND r.trigger_type='user_message'",
+        )
+        .get(runId) as any;
+      if (!r || !r.body.includes(text(a.evidence, 2000)))
+        throw new InputError("提议须关联当前用户意图");
+      const g = this.goal(a.goal_id);
+      this.assertScope(r, g, "goal");
+      this.revision(g, a.goal_revision);
+      const scope = text(a.scope, 500),
+        until = future(a.support_until, this.now(), true);
+      const existing = this.db
+        .prepare(
+          "SELECT * FROM delegation_proposals WHERE run_id=? AND goal_id=?",
+        )
+        .get(runId, g.id) as any;
+      if (existing) return existing;
+      const id = randomUUID();
+      this.db
+        .prepare(
+          "UPDATE delegation_proposals SET status='superseded' WHERE goal_id=? AND status IN ('draft','offered')",
+        )
+        .run(g.id);
+      this.db
+        .prepare(
+          "INSERT INTO delegation_proposals VALUES(?,?,?,?,?,?,?,'draft',?,NULL)",
+        )
+        .run(
+          id,
+          g.id,
+          g.revision,
+          runId,
+          scope,
+          Number(!!a.allow_search),
+          until,
+          this.now() + 86400000,
+        );
+      return {
+        id,
+        goal_id: g.id,
+        scope,
+        allow_search: !!a.allow_search,
+        support_until: until,
+        instruction:
+          "请在本轮回复中逐字呈现 scope。提议实际展示后，用户可自然确认；此刻未开启跟进。",
+      };
+    });
+  }
   command(name: string, a: any, runId: string | null, operation: string) {
+    // Goal tools use one authoritative identity/version; accept the same names used by progress tools.
+    if (name === "goal_manage" && a && a.action !== "create") {
+      a = { ...a };
+      if (a.id && a.goal_id && a.id !== a.goal_id)
+        throw new InputError("目标标识冲突", 409);
+      if (
+        a.revision != null &&
+        a.goal_revision != null &&
+        a.revision !== a.goal_revision
+      )
+        throw new InputError("目标版本冲突", 409);
+      a.id = a.id ?? a.goal_id;
+      a.revision = a.revision ?? a.goal_revision;
+      delete a.goal_id;
+      delete a.goal_revision;
+      if (a.proposal_id && !a.id) {
+        const p = this.db
+          .prepare(
+            "SELECT goal_id,goal_revision FROM delegation_proposals WHERE id=?",
+          )
+          .get(a.proposal_id) as any;
+        if (p) {
+          a.id = p.goal_id;
+          a.revision = a.revision ?? p.goal_revision;
+        }
+      }
+      if (!a.id || !Number.isSafeInteger(a.revision))
+        throw new InputError(
+          "更新目标需提供当前 id/revision；goal_id/goal_revision 也可，不能省略或猜测版本",
+        );
+    }
     return this.store.transaction(() => {
       const actor = runId
         ? (this.db
@@ -474,11 +620,16 @@ export class Work {
         "fact",
         "fact_id",
         "progress_mode",
+        "replace_span",
         "value",
         "unit",
         "notification_mode",
         "scope",
         "support_until",
+        "proposal_id",
+        "matter_id",
+        "new_matter",
+        "contact_limit",
       ]);
       if (typeof operation !== "string" || !operation.trim())
         throw new InputError("缺少操作标识");
@@ -673,17 +824,26 @@ export class Work {
         };
       } else if (name === "goal_manage") {
         if (a.action === "create") {
-          if (a.autonomous !== true)
-            throw new InputError(
-              "持续目标需要明确持续推进授权；具体提醒请使用任务工具",
-            );
+          if (actor && a.autonomous === true) this.assertDelegation(actor, a);
+          const existing = this.db
+            .prepare(
+              "SELECT * FROM goals WHERE title=? AND status NOT IN ('completed','cancelled')",
+            )
+            .get(a.title) as any;
+          if (actor && existing)
+            throw new InputError("同名目标已存在，请读取最新状态后复用", 409);
           if (
             actor &&
-            !/持续|跟进|推进|照看|直到|全程|帮我安排|帮我完成|制定.*计划/.test(
-              a.evidence,
-            )
+            !a.matter_id &&
+            a.new_matter !== true &&
+            this.db
+              .prepare("SELECT 1 FROM matters WHERE goal_id IS NULL LIMIT 1")
+              .get()
           )
-            throw new InputError("请先确认是否授权持续推进");
+            throw new InputError(
+              "已有未关联的对话事项。请从 personalContext.working 选择 matter_id；只有明确独立的新事项才传 new_matter=true，不能丢掉已有决定与问题。",
+              409,
+            );
           g = this.makeGoal(a, authority, "outcome");
           if (actor)
             this.updateGoal(g.id, {
@@ -699,17 +859,61 @@ export class Work {
                 },
               ],
             });
-          summary = `已接住「${g.title}」，将在授权范围内持续整理和推进${g.allow_search ? "，允许搜索公开资料" : ""}；预订、付款和对外发送由你决定。`;
-          this.updateGoal(g.id, { next_action: "准备首次评估" });
+          summary =
+            a.autonomous !== true
+              ? `已记下「${g.title}」，暂不启动后台跟进。`
+              : `已接住「${g.title}」，将在授权范围内持续整理和推进${g.allow_search ? "，允许搜索公开资料" : ""}；预订、付款和对外发送由你决定。`;
+          this.updateGoal(g.id, {
+            next_action:
+              a.autonomous === true
+                ? "准备首次评估"
+                : "已记录，等待你的下一步安排",
+          });
+          if (a.matter_id) {
+            const prior = this.db
+              .prepare("SELECT * FROM matters WHERE id=? AND goal_id IS NULL")
+              .get(a.matter_id) as any;
+            if (!prior) throw new InputError("原对话事项不存在或已关联", 409);
+            const fresh = new ContextService(this.store, this.now).matter(g.id);
+            this.db.prepare("DELETE FROM matters WHERE id=?").run(fresh.id);
+            this.db
+              .prepare(
+                "UPDATE matters SET goal_id=?,revision=revision+1,updated_at=? WHERE id=?",
+              )
+              .run(g.id, this.now(), prior.id);
+          }
         } else {
           g = this.goal(text(a.id, 100));
-          this.assertScope(actor, g, "goal");
+          if (!a.proposal_id) this.assertScope(actor, g, "goal");
           this.revision(g, a.revision);
           if (a.action === "notification") {
             const mode = choice(a.notification_mode, [
               "inherit",
               ...GOAL_MODES,
             ]);
+            if (a.contact_limit !== undefined) {
+              const l = a.contact_limit;
+              if (l === null)
+                this.db
+                  .prepare("DELETE FROM goal_contact_limits WHERE goal_id=?")
+                  .run(g.id);
+              else {
+                if (
+                  !Number.isSafeInteger(l.count) ||
+                  l.count < 1 ||
+                  l.count > 10 ||
+                  !Number.isSafeInteger(l.days) ||
+                  l.days < 1 ||
+                  l.days > 30
+                )
+                  throw new InputError("联系上限须为1至30天内1至10次");
+                this.db
+                  .prepare(
+                    "INSERT INTO goal_contact_limits VALUES(?,?,?,1) ON CONFLICT(goal_id) DO UPDATE SET count=excluded.count,days=excluded.days,revision=goal_contact_limits.revision+1",
+                  )
+                  .run(g.id, l.count, l.days);
+              }
+            }
             this.updateGoal(g.id, { notification_mode: mode });
             this.db
               .prepare(
@@ -741,10 +945,11 @@ export class Work {
               "已安排按当前状态重新评估。原任务结果不明的记录保留，需要重新执行时请明确改期。";
           } else if (a.action === "upgrade" || a.action === "reopen") {
             if (
-              a.autonomous !== true ||
-              (actor && !/持续|跟进|推进|重新|恢复/.test(a.evidence))
+              a.autonomous === false ||
+              (a.autonomous !== true && !a.proposal_id)
             )
               throw new InputError("需要新的持续委托");
+            if (actor) this.assertDelegation(actor, a, g);
             this.invalidateGoal(g.id, "授权已更新", undefined, true);
             this.updateGoal(g.id, {
               kind: "outcome",
@@ -862,6 +1067,54 @@ export class Work {
           : null;
         if (a.fact_id && !oldFact) throw new InputError("原事实不存在");
         if (
+          oldFact &&
+          !new ContextService(this.store, this.now).readable(
+            oldFact.source,
+            oldFact.content,
+            oldFact.updated_at,
+          )
+        )
+          throw new InputError(
+            "原事实已失效，请依据本轮原话新增事实，不能恢复旧来源。",
+          );
+        // A correction may replace one literal span; untouched evidence retains its original source/time.
+        let retainedFact: any = null;
+        if (oldFact && a.replace_span !== undefined) {
+          const span = text(a.replace_span, 2000);
+          if (
+            !oldFact.content.includes(span) ||
+            oldFact.content.indexOf(span) !== oldFact.content.lastIndexOf(span)
+          )
+            throw new InputError(
+              "replace_span 必须是原事实中唯一出现的待更正片段，不得猜测或改写。",
+            );
+          if (
+            actor &&
+            span === oldFact.content &&
+            /[，,；;。]\s*\S/.test(span) &&
+            !/整条|全部|整段/.test(actor.body)
+          )
+            throw new InputError(
+              "原记录包含多项事实，请只指定本次改变的 replace_span，未改变的信息由服务保留。",
+            );
+          const rest = oldFact.content
+            .replace(span, "")
+            .replace(/^[，,；;。、\s]+|[，,；;。、\s]+$/g, "")
+            .trim();
+          if (rest)
+            retainedFact = { ...oldFact, id: randomUUID(), content: rest };
+        } else if (
+          actor &&
+          oldFact &&
+          ["fact", "correct"].includes(mode) &&
+          /[，,；;。]\s*\S/.test(oldFact.content)
+        ) {
+          throw new InputError(
+            "原记录包含多项事实。更正时必须用 replace_span 指定实际改变的原文片段，服务会保留其余信息；无需让用户重新提供。",
+          );
+        }
+
+        if (
           mode !== "fact" &&
           mode !== "correct" &&
           (typeof a.value !== "number" ||
@@ -871,6 +1124,32 @@ export class Work {
           throw new InputError("进展数值无效");
         if (mode === "increment" && !oldFact)
           throw new InputError("累计进展需明确已有进展项，不能猜测归属");
+        if (oldFact) {
+          this.db
+            .prepare(
+              "DELETE FROM evidence_fragments WHERE source_id=? AND signature=?",
+            )
+            .run(oldFact.source, hash(oldFact.content));
+          if (retainedFact)
+            this.db
+              .prepare("INSERT OR IGNORE INTO evidence_fragments VALUES(?,?)")
+              .run(retainedFact.source, hash(retainedFact.content));
+          this.db
+            .prepare("INSERT INTO evidence_history VALUES(?,?,?,?,?,?,?)")
+            .run(
+              randomUUID(),
+              g.id,
+              oldFact.source,
+              oldFact.content,
+              "historical",
+              authority,
+              oldFact.updated_at,
+            );
+          new ContextService(this.store, this.now).exclude(
+            oldFact.source,
+            "superseded_goal_fact",
+          );
+        }
         this.invalidateGoal(g.id, "用户补充或纠正了目标事实", undefined, true);
         const fact = {
           id: oldFact?.id || randomUUID(),
@@ -885,7 +1164,11 @@ export class Work {
           updated_at: this.now(),
         };
         this.updateGoal(g.id, {
-          facts: [...facts.filter((f) => f.id !== fact.id), fact],
+          facts: [
+            ...facts.filter((f) => f.id !== fact.id),
+            ...(retainedFact ? [retainedFact] : []),
+            fact,
+          ],
           wait_condition: "",
           status: g.status === "paused" ? "paused" : "active",
           next_action: "已收到新的信息，按最新情况更新安排",
@@ -895,10 +1178,16 @@ export class Work {
             "UPDATE goals SET facts_revision=facts_revision+1 WHERE id=?",
           )
           .run(g.id);
-        // A changed itinerary invalidates only agent-owned plans. User reminders retain their contract.
-        for (const child of this.tasks(g.id).filter(
-          (x) => x.owner === "goal" && !closed(x.status),
-        )) {
+        // Changed facts invalidate their dependent internal tasks, never explicit reminders.
+        for (const child of this.tasks(g.id).filter((x) => {
+          if (x.owner !== "goal" || closed(x.status) || !oldFact) return false;
+          const d = this.db
+            .prepare(
+              "SELECT fact_ids FROM task_fact_dependencies WHERE task_id=?",
+            )
+            .get(x.id) as any;
+          return !d || parse(d.fact_ids).includes(oldFact.id);
+        })) {
           this.db
             .prepare(
               "UPDATE tasks SET status='cancelled',revision=revision+1,reason='目标事实已变化，等待重新规划' WHERE id=?",
@@ -910,7 +1199,7 @@ export class Work {
         summary =
           "已更新目标信息，后续按最新情况推进；你明确设置的提醒不会被擅自改期。";
         this.event(g.id, "progress", content, actor?.message_id);
-        result = { goal_id: g.id, summary, fact };
+        result = { goal_id: g.id, summary, fact, retained_fact: retainedFact };
       } else throw new InputError("工作操作不存在");
       this.db
         .prepare("INSERT INTO work_actions VALUES(?,?,?,?,?)")
@@ -1080,6 +1369,8 @@ export class Work {
     };
   }
   valid(w: any) {
+    if (!new ContextService(this.store, this.now).check(w.run_id, "commit"))
+      return false;
     const g = this.goal(w.goal_id),
       snap = parse(w.snapshot),
       t = w.task_id ? this.task(w.task_id) : null;
@@ -1128,7 +1419,18 @@ export class Work {
             .all() as any[]
         ).map((x) => {
           const g = this.goal(x.id);
-          return { ...g, tasks: this.tasks(g.id).slice(-12) };
+          return {
+            ...new ContextService(this.store, this.now).goalView(g),
+            tasks: this.tasks(g.id)
+              .filter((t) =>
+                new ContextService(this.store, this.now).readable(
+                  t.authority_ref,
+                  t.title + " " + t.expected_result,
+                  t.updated_at,
+                ),
+              )
+              .slice(-12),
+          };
         }),
         replyScope: linked || null,
         notificationDefaults: this.defaults(),
@@ -1156,16 +1458,32 @@ export class Work {
       now: this.now(),
       localTime: localTime(this.now()),
       timezone: "Asia/Shanghai",
-      goal: g,
+      goal: new ContextService(this.store, this.now).goalView(g),
       task: t,
+      personalContext: proactiveContext(this.store, g.id),
       tasks: this.tasks(g.id)
-        .filter((x) => !closed(x.status))
+        .filter(
+          (x) =>
+            !closed(x.status) &&
+            new ContextService(this.store, this.now).readable(
+              x.authority_ref,
+              x.title + " " + x.expected_result,
+              x.updated_at,
+            ),
+        )
         .slice(0, 8),
       reviews: this.db
         .prepare(
           "SELECT summary,next_action,wait_condition,created_at FROM goal_reviews WHERE goal_id=? ORDER BY created_at DESC LIMIT 6",
         )
-        .all(g.id),
+        .all(g.id)
+        .filter((r: any) =>
+          new ContextService(this.store, this.now).readable(
+            null,
+            [r.summary, r.next_action, r.wait_condition].join(" "),
+            r.created_at,
+          ),
+        ),
       artifact: a && !a.historicalContext ? a : null,
       artifactRef: a
         ? {
@@ -1186,11 +1504,8 @@ export class Work {
         .all(runId),
       authority: {
         delegation:
-          (
-            this.db
-              .prepare("SELECT body FROM messages WHERE id=?")
-              .get(g.authority_ref) as any
-          )?.body || g.completion_criteria,
+          new ContextService(this.store, this.now).source(g.authority_ref)
+            ?.body || "以已保存的执行权限为准，不复用已失效授权原文",
         allowSearch: t ? t.allow_search : g.allow_search,
         externalActions: false,
         canChangeUserTasks: false,
@@ -1557,6 +1872,7 @@ export class Work {
           "next_check_at",
           "task_changes",
           "notify",
+          "question",
         ]);
         const status = choice(p.status, ["done", "waiting"]),
           summary = text(p.summary, 1200),
@@ -1588,6 +1904,15 @@ export class Work {
               .get(runId))
         )
           throw new InputError("检索任务完成需要真实来源");
+        let questionId: string | null = null;
+        if (p.question) {
+          object(p.question, ["key", "text"]);
+          questionId = new ContextService(this.store, this.now).question(
+            g.id,
+            p.question.key,
+            p.question.text,
+          ).id;
+        }
         const artifact = this.publishArtifact(runId, g, t);
         let scheduleAt =
           p.next_check_at === undefined || p.next_check_at === null
@@ -1772,7 +2097,11 @@ export class Work {
               "discretionary",
               notify.event,
               text(notify.message, 1200),
-              { mode: "result_and_failure", quiet: "respect_window" },
+              {
+                mode: "result_and_failure",
+                quiet: "respect_window",
+                questionId,
+              },
             );
         }
         this.db
@@ -1845,7 +2174,17 @@ export class Work {
         Math.max(now, contract.deliver_at || 0) + DAY,
         now,
         "",
-        json(contract),
+        json({
+          ...contract,
+          inputWatermark:
+            (
+              this.db
+                .prepare(
+                  "SELECT id FROM messages WHERE role='user' ORDER BY rowid DESC LIMIT 1",
+                )
+                .get() as any
+            )?.id || null,
+        }),
       );
   }
   quietNext(now: number) {
@@ -1886,7 +2225,19 @@ export class Work {
                 .get(c.run_id) as any
             )?.snapshot || "{}",
           ).factsRevision !== g.facts_revision;
+        const deterministic = t?.kind === "reminder";
+        const latestInput =
+          (
+            this.db
+              .prepare(
+                "SELECT id FROM messages WHERE role='user' ORDER BY rowid DESC LIMIT 1",
+              )
+              .get() as any
+          )?.id || null;
         const stale =
+          (!deterministic &&
+            contract.inputWatermark !== undefined &&
+            contract.inputWatermark !== latestInput) ||
           resultFactsChanged ||
           profile.revision !== c.profile_revision ||
           closed(g.status) ||
@@ -1894,8 +2245,18 @@ export class Work {
           (t && ["paused", "cancelled"].includes(t.status)) ||
           (t && t.revision !== c.task_revision) ||
           (c.source === "goal" && g.revision !== c.goal_revision) ||
-          Number(this.store.getMeta("context_epoch") || 0) !== c.context_epoch;
-        if (stale || c.expires_at < now) {
+          (!deterministic &&
+            Number(this.store.getMeta("context_epoch") || 0) !==
+              c.context_epoch);
+        if (
+          stale ||
+          (contract.questionId &&
+            !new ContextService(this.store, this.now).questionAllowed(
+              contract.questionId,
+              g.id,
+            )) ||
+          c.expires_at < now
+        ) {
           this.db
             .prepare(
               "UPDATE delivery_candidates SET status='suppressed',decision_reason=? WHERE id=?",
@@ -1905,7 +2266,33 @@ export class Work {
         }
         let at =
           contract.quiet === "respect_window" ? this.quietNext(now) : now;
+        if (deterministic) {
+          const pending = new ContextService(
+            this.store,
+            this.now,
+          ).pendingReminder(g.id, t.title);
+          if (pending) {
+            this.db
+              .prepare(
+                "UPDATE delivery_candidates SET eligible_at=?,status=?,decision_reason='先处理用户对提醒的变更' WHERE id=?",
+              )
+              .run(
+                now + 5000,
+                now - pending.created_at > 120000 ? "suppressed" : "pending",
+                c.id,
+              );
+            continue;
+          }
+        }
         if (c.obligation === "discretionary") {
+          if (new ContextService(this.store, this.now).contactLimit(g.id)) {
+            this.db
+              .prepare(
+                "UPDATE delivery_candidates SET eligible_at=?,decision_reason='达到目标联系上限' WHERE id=?",
+              )
+              .run(now + 60 * MINUTE, c.id);
+            continue;
+          }
           const mode =
             g.notification_mode === "inherit"
               ? this.defaults().goal_mode
@@ -1954,6 +2341,10 @@ export class Work {
             .run(at, c.id);
           continue;
         }
+        if (contract.questionId)
+          new ContextService(this.store, this.now).deliveredQuestion(
+            contract.questionId,
+          );
         this.publish(
           c.event_id,
           c.body,
@@ -2059,8 +2450,16 @@ export class Work {
           this.schedule(job.id, job.kind, this.now() + MINUTE);
           continue;
         }
+        const pendingChange = new ContextService(
+          this.store,
+          this.now,
+        ).pendingReminder(g.id, t.title);
+        if (pendingChange && this.now() - pendingChange.created_at <= 120000) {
+          this.schedule(job.id, job.kind, this.now() + 5000);
+          continue;
+        }
         const now = this.now(),
-          late = now - t.next_run_at,
+          late = pendingChange ? t.late_window + 1 : now - t.next_run_at,
           old = this.db
             .prepare(
               "SELECT * FROM task_occurrences WHERE task_id=? AND schedule_revision=? AND scheduled_for=?",
